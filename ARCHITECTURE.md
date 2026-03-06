@@ -1,17 +1,18 @@
 # hikmalab — Architecture & Desired State
 
 > This document captures the **desired state** of the system — what it must achieve and why.
-> Implementation decisions (protocols, tools, specific algorithms) are made per phase, not here.
-> When something is undecided, it is marked as **[OPEN]**.
+> Decided implementation choices are recorded inline and in the Open Decisions Log.
+> Remaining unknowns are marked **[OPEN]**.
 
 ---
 
 ## Vision
 
-A centralized management system that allows a trusted authority (parent, teacher, mentor)
-to control what a student can access on their Ubuntu machine — blocking distractions,
+A personal tool for a trusted authority (parent, teacher, mentor) to control
+what a student can access on their Ubuntu machine — blocking distractions,
 enforcing study schedules, and keeping the device focused on learning.
 
+Built for personal use: family, friends, and close students.
 The system must work over the public internet, not require a local network,
 and survive student attempts to bypass it.
 
@@ -21,7 +22,7 @@ and survive student attempts to bypass it.
 
 1. **Agent owns the machine.** The agent runs with root privileges. The student user has no way to stop, modify, or uninstall it without the admin's involvement.
 2. **Rules are always enforced.** Whether online or offline, the last known rules must be active. Losing internet connection must not disable restrictions.
-3. **Passwords never leave the device.** During onboarding, credentials are used locally to configure the machine. They are never transmitted to or stored on the server.
+3. **Old credentials never leave the device.** The existing sudo password is used locally only, never transmitted. The new root password is sent to the admin via Telegram (over HTTPS) before the change is applied — the admin is the sole holder of emergency root access.
 4. **Admin is the single source of truth.** All rule changes originate from the admin. Agents only receive, never decide.
 5. **Transparency by contract.** Students and parents agree to this level of control. The system is not hidden — it is a known, agreed-upon tool.
 
@@ -29,12 +30,13 @@ and survive student attempts to bypass it.
 
 ## Actors
 
-| Actor         | Description                                                         |
-|---------------|---------------------------------------------------------------------|
-| **Admin**     | Parent, teacher, or mentor. Sets rules, manages machines via CLI.   |
-| **Student**   | Uses the managed machine. Has a limited OS user account, no sudo.   |
-| **Agent**     | Software running on the student machine. Enforces rules as root.    |
-| **Server**    | Central service. Stores rules and state. Relays between admin and agents. |
+| Actor            | Description                                                               |
+|------------------|---------------------------------------------------------------------------|
+| **Admin**        | Parent, teacher, or mentor. Sets rules, manages machines via Telegram.    |
+| **Student**      | Uses the managed machine. Has a limited OS user account, no sudo.         |
+| **Agent**        | Software running on the student machine. Enforces rules as root.          |
+| **Server**       | Central service. Stores rules and state. Relays between admin and agents. |
+| **Telegram Bot** | The admin's interface. Receives commands, shows status, sends alerts.     |
 
 ---
 
@@ -43,73 +45,96 @@ and survive student attempts to bypass it.
 ### 1. Server (`hikmalab-server`)
 
 **Desired state:**
-- Admin creates an account and logs in securely. No plaintext passwords stored anywhere.
+- Admin is registered by their Telegram user ID — no separate account or password needed.
 - Admin can register, view, and manage client machines.
 - Admin can define rules: website blocklists, application blocklists, time schedules.
-- Rules are stored reliably. If the server restarts, nothing is lost.
-- Agents connect to the server and receive their assigned rules.
+- Rules are stored reliably in PostgreSQL. If the server restarts, nothing is lost.
+- Agents connect to the server via WebSocket and receive commands when pushed.
 - Server knows which agents are online, offline, or have not synced recently.
+- Server receives batched activity logs (DNS visits, app usage) from agents and stores them.
+- Server fetches and distributes domain category lists (Hagezi, OISD) to agents — agents never hit external URLs directly.
 - Server must be deployable on a single low-cost VPS.
+- Telegram bot runs embedded in the same server process.
 
-**[OPEN]:** Database engine. Likely PostgreSQL, but not decided.
-**[OPEN]:** How agents connect — polling vs persistent connection.
-**[OPEN]:** Authentication mechanism for admin login.
-**[OPEN]:** Authentication mechanism for agent-to-server identity.
+**[OPEN]:** How admin Telegram ID is first registered with the server (bot conversation flow vs config).
 
 ---
 
 ### 2. Client Agent (`hikmalab-agent`)
 
 **Desired state:**
-- Runs as a system-level service with root privileges on Ubuntu.
+- Runs as a systemd service with root privileges on Ubuntu.
 - Starts automatically on boot. Cannot be stopped by the student user.
-- If the agent process is killed by any means, it restarts immediately.
-- Periodically syncs rules from the server when internet is available.
+- If the agent process is killed by any means, systemd restarts it immediately (`Restart=always`).
 - Caches the latest rules locally. Enforces them even when offline.
 - Enforces three types of restrictions:
-  - **Web blocking:** Student cannot access blacklisted websites or domains.
+  - **Web blocking:** Local DNS resolver (dnsmasq) returns nothing for blocked domains. nftables seals DNS port 53 to prevent custom DNS servers. Known DoH server IPs are blocked at the firewall.
   - **App blocking:** Student cannot open or run blacklisted applications.
   - **Time restrictions:** Internet or apps are unavailable outside allowed hours.
-- Any attempt to bypass restrictions (changing DNS, using a proxy, VPN) should be detectable or preventable.
-- Agent sends basic status back to server: last sync time, rule version active, online/offline.
+- nftables blocks common VPN ports (OpenVPN 1194, WireGuard 51820, L2TP 1723) and known Tor directory IPs.
+- Agent detects VPN and proxy process names via app logs and reports them to the server.
+- Agent sends status to server via regular HTTP: last sync time, active rule version, online/offline.
+- Agent receives rule updates and commands via a persistent WebSocket connection to the server. The agent always opens this connection — the server never dials out to agents.
+- Agent logs all DNS queries (domain, timestamp, blocked/allowed) via the local resolver and batches them to the server each sync cycle.
+- Agent scans running processes every 60 seconds and logs app usage (process name, executable path, timestamp, blocked/allowed).
+- Visited domains are checked against the category database distributed by the server (social media, adult, gambling, gaming, piracy, etc.). This is for monitoring — the admin reviews and decides what to block per child.
+- Uncategorized domains visited frequently are surfaced to the admin for manual review.
+- Logs are batched and sent on the sync cycle, not in real-time.
 
-**[OPEN]:** Web blocking mechanism — DNS, firewall rules, or proxy.
-**[OPEN]:** How agent detects and blocks VPN/proxy bypass attempts.
-**[OPEN]:** How the agent updates itself when a new version is released.
+**Agent identity and authentication:**
+- Each machine is identified by its `/etc/machine-id` — a stable, unique Linux-generated identifier.
+- During enrollment, the server issues a secret auth token tied to that machine ID.
+- The token is stored in `/etc/hikmalab/agent.conf` (owner: root, permissions: 600). The student user cannot read it.
+- On every request to the server, the agent presents both: machine ID (identity) and auth token (proof).
+- If a machine is decommissioned or compromised, the admin revokes the token. The server rejects all further requests from that machine ID.
+
+**Agent self-update:**
+- When the server signals a new version is available, the agent downloads the new binary and verifies its checksum.
+- Atomically replaces itself on disk via `rename()` — no moment where the binary is missing or corrupt.
+- Exits cleanly. Systemd's `Restart=always` starts the new binary automatically.
 
 ---
 
-### 3. Admin CLI (`hikmalab-admin`)
+### 3. Telegram Bot (`hikmalab-bot`)
 
 **Desired state:**
-- Admin installs this tool on their own machine (any OS, ideally).
-- Admin logs in once, stays authenticated across sessions.
+- Runs embedded in the server process.
+- Admin interacts with the system entirely through this private bot.
+- No software to install — works from any device with Telegram.
+- Admin is identified by their Telegram user ID. Bot ignores all messages from any other ID.
 - Admin can list all enrolled machines and see their status.
 - Admin can create, update, and delete rules.
 - Admin can assign rules to specific machines or groups of machines.
 - Admin can initiate a remote machine removal (triggers uninstall on agent side).
-- Commands are simple, predictable, and scriptable.
-
-**[OPEN]:** Target OS for admin CLI — Linux only or cross-platform.
+- Admin can generate enrollment tokens for onboarding new machines.
+- Bot sends proactive alerts: machine offline too long, blocked attempt spikes, flagged category visits.
+- Bot sends daily or weekly activity summaries per machine: sites visited, apps used, flagged content.
+- Admin can block a domain directly from the bot when reviewing an activity report.
+- Commands are simple text or inline keyboard buttons — no technical knowledge required.
 
 ---
 
 ### 4. Onboarding Script
 
 **Desired state:**
-- Admin shares a single command or script file with the student/parent.
-- Running the script on the Ubuntu machine:
-  1. Asks for the current sudo password.
-  2. Immediately rotates the sudo password to something unknown to the student.
-  3. Creates a new student user account with no administrative privileges.
-  4. Installs the agent as a system service.
-  5. Registers the machine with the admin's server account.
+- Admin generates an enrollment token from the Telegram bot.
+- Admin shares a single install command with the student/parent. The token is embedded in the command.
+- The token ties the enrollment to the admin's account on the server.
+- Running the command on the Ubuntu machine:
+  1. Downloads the onboarding script from the server (authenticated by the enrollment token).
+  2. Asks for the current sudo password — used locally to gain root, never transmitted.
+  3. Reads `/etc/machine-id` and requests a machine auth token from the server.
+  4. Generates a new random root password in memory.
+  5. Sends the new password to the server, which forwards it to the admin via Telegram.
+  6. Waits for confirmed delivery. Only if confirmed: rotates the sudo/root password.
+  7. If delivery fails: aborts. The old password is unchanged. Nothing is left in an unknown state.
+  8. Creates a new student user account with no administrative privileges.
+  9. Writes machine auth token to `/etc/hikmalab/agent.conf` (root-only, permissions 600).
+  10. Installs the agent as a systemd service running as root.
 - The old sudo password is used locally only, never transmitted.
-- The new sudo/root credentials are stored securely — accessible to the admin in emergencies, but not to the student.
-- The script must be safe to run: verifiable, from a trusted source, with clear output at each step.
+- The script must be verifiable (checksum published separately) with clear output at each step.
 - Video instructions and written guides accompany the script.
 
-**[OPEN]:** How emergency root access is stored and retrieved safely.
 **[OPEN]:** Whether the script also handles agent updates during re-runs.
 
 ---
@@ -118,12 +143,13 @@ and survive student attempts to bypass it.
 
 The following entities must exist. Schema is decided later.
 
-- **Admin** — account, credentials, contact info
-- **Organization** — optional grouping of machines under one admin (Phase 2+)
-- **Machine** — enrolled client device, linked to admin, has status and last-seen time
+- **Admin** — Telegram user ID, contact info
+- **Machine** — enrolled device, linked to admin, has auth token, status, and last-seen time
 - **Rule** — a restriction definition (web block, app block, time schedule)
 - **RuleSet** — a named collection of rules assignable to machines
 - **SyncLog** — record of when each machine last pulled its rules
+- **VisitLog** — domain, timestamp, machine, blocked (yes/no), category if known
+- **AppLog** — process name, executable path, timestamp, machine, blocked (yes/no)
 
 ---
 
@@ -133,43 +159,29 @@ The following entities must exist. Schema is decided later.
 
 **Goal:** One admin can enroll Ubuntu machines, define rules, and have them enforced.
 
-Must have:
-- Admin account creation and login
+- Admin identity via Telegram ID
 - Machine enrollment via onboarding script
-- Web blocking, app blocking, time restrictions
-- Rule sync: online agents pull latest rules; cached rules enforced offline
-- Admin CLI: login, list machines, manage rules
+- Web blocking (dnsmasq + nftables), app blocking, time restrictions
+- Rule updates delivered via WebSocket push; cached rules enforced offline
+- Telegram bot: list machines, manage rules, assign rules, generate enrollment tokens
 - Basic machine status visibility (online/offline, last sync)
+- Activity logging: DNS visit logs and app usage logs batched to server
 
 ### Phase 2 — Hardening & Usability
 
 **Goal:** System is reliable and usable at small scale (up to ~30 machines).
 
 - Agent tamper detection and self-recovery
-- Admin alerts: machine offline too long, blocked attempt spikes
-- Block attempt logs per machine
-- Rule templates (presets for common scenarios)
-- Graceful uninstall flow (admin-initiated only)
-- Multiple machines per admin with group-level rules
+- Domain category monitoring with bot alerts for flagged content (social media, adult, etc.)
+- Bot alerts: machine offline too long, blocked attempt spikes, VPN/proxy detected
+- Rule templates (presets for common scenarios, selectable in bot)
+- Graceful uninstall flow (admin-initiated via bot)
+- Group-level rule assignment across multiple machines
+- Agent self-update mechanism
 
-### Phase 3 — Web Dashboard & Organizations
+### Future — Foundation for Education Projects
 
-**Goal:** Non-technical users can manage machines without a CLI.
-
-- Web dashboard replaces CLI for day-to-day management
-- Multi-admin organizations (e.g., a school with multiple teachers)
-- Per-group rule assignment
-- Usage and block reports (weekly summaries, trends)
-
-### Phase 4 — SaaS & Scale
-
-**Goal:** Schools and education centers can sign up and manage themselves.
-
-- Multi-tenant server
-- Self-serve organization onboarding
-- Subscription and billing
-- AI-assisted learning CLI on the student machine
-- Remote lesson video player on the student machine
+This system is intentionally personal-scale. It is the foundation for future education-focused projects. Scaling decisions (multi-tenant, organizations, billing) are deferred until there is a concrete reason to build them.
 
 ---
 
@@ -177,23 +189,26 @@ Must have:
 
 - No passwords, tokens, or secrets are stored in plaintext anywhere.
 - The student cannot disable, modify, or read the agent's configuration.
-- All communication between agent and server is encrypted in transit.
-- Admin-to-server communication is authenticated and encrypted.
+- All communication between agent and server is encrypted in transit (HTTPS/WSS).
+- Admin-to-server communication is authenticated via Telegram identity.
 - The onboarding script must be verifiable (checksum or signature) before execution.
-- Emergency root access to a machine must be possible for the admin, but must require explicit action — not automatic or passive.
+- The admin holds the root password for every managed machine. Emergency access requires explicit admin action — not automatic or passive.
 - Server compromise must not give an attacker control over client machines beyond what is already possible through the rule system.
 
 ---
 
 ## Open Decisions Log
 
-| # | Decision | Options Considered | Status |
-|---|----------|--------------------|--------|
-| 1 | Web blocking mechanism | DNS, iptables, transparent proxy | OPEN |
-| 2 | Agent-server communication model | Polling, WebSocket, long-poll | OPEN |
-| 3 | Agent authentication to server | Pre-shared token, mTLS, signed JWT | OPEN |
-| 4 | Emergency root access storage | Encrypted vault, admin-held key, split key | OPEN |
-| 5 | Agent self-update mechanism | Server-pushed binary, package manager, manual | OPEN |
-| 6 | Admin CLI target platform | Linux only, cross-platform binary | OPEN |
-| 7 | Database engine | PostgreSQL, SQLite, file-based | OPEN |
-| 8 | VPN/proxy bypass prevention | Kill-switch rules, network monitoring | OPEN |
+| # | Decision | Resolution | Status |
+|---|----------|------------|--------|
+| 1 | Web blocking mechanism | Local DNS resolver (dnsmasq) + nftables to seal DNS port 53 and block known DoH IPs. Transparent proxy rejected — too complex, breaks apps. | **DECIDED** |
+| 2 | Agent-server communication | Two channels: agent→server via HTTP (status, logs); server→agent via persistent WebSocket (commands, rule updates). Agent always opens the connection — server never dials out. | **DECIDED** |
+| 3 | Agent authentication | `/etc/machine-id` as identity + server-issued secret token stored in root-only `/etc/hikmalab/agent.conf`. | **DECIDED** |
+| 4 | Emergency root access | New root password sent to admin via Telegram before being applied. Admin holds it. | **DECIDED** |
+| 5 | Agent self-update | Agent downloads new binary, verifies checksum, atomically replaces via `rename()`, exits. Systemd restarts with new binary. | **DECIDED** |
+| 6 | Bot hosting | Embedded in the server process. | **DECIDED** |
+| 7 | Database engine | PostgreSQL. | **DECIDED** |
+| 8 | VPN/proxy bypass prevention | nftables blocks common VPN ports and Tor IPs. DNS sealed at kernel level. VPN process names detected via app logs. | **DECIDED** |
+| 9 | Auth token revocation | Server rejects all requests from a revoked machine ID immediately. | **DECIDED** |
+| 10 | Admin Telegram ID registration | How admin first registers their Telegram ID with the server. | **OPEN** |
+| 11 | Onboarding script re-runs | Whether re-running the script on an already-enrolled machine updates the agent or re-enrolls. | **OPEN** |

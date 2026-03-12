@@ -3,6 +3,10 @@
 > This document captures the **desired state** of the system — what it must achieve and why.
 > Decided implementation choices are recorded inline and in the Open Decisions Log.
 > Remaining unknowns are marked **[OPEN]**.
+>
+> **Component documents:**
+> - [CLIENT_ARCHITECTURE.md](CLIENT_ARCHITECTURE.md) — detailed agent design, enforcement logic, protocol, and open decisions
+> - [DIE_WITH_OS.md](DIE_WITH_OS.md) — Supervisor design: zero-downtime hot-swap, self-update, and agent watchdog
 
 ---
 
@@ -65,7 +69,7 @@ and survive student attempts to bypass it.
 **Desired state:**
 - Runs as a systemd service with root privileges on Ubuntu.
 - Starts automatically on boot. Cannot be stopped by the student user.
-- If the agent process is killed by any means, systemd restarts it immediately (`Restart=always`).
+- A **Supervisor** process sits between systemd and the agent. systemd manages the Supervisor; the Supervisor manages the agent as its child. If the agent is killed, the Supervisor restarts it within 1–2 seconds.
 - Caches the latest rules locally. Enforces them even when offline.
 - Enforces three types of restrictions:
   - **Web blocking:** Local DNS resolver (dnsmasq) returns nothing for blocked domains. nftables seals DNS port 53 to prevent custom DNS servers. Known DoH server IPs are blocked at the firewall.
@@ -73,13 +77,12 @@ and survive student attempts to bypass it.
   - **Time restrictions:** Internet or apps are unavailable outside allowed hours.
 - nftables blocks common VPN ports (OpenVPN 1194, WireGuard 51820, L2TP 1723) and known Tor directory IPs.
 - Agent detects VPN and proxy process names via app logs and reports them to the server.
-- Agent sends status to server via regular HTTP: last sync time, active rule version, online/offline.
-- Agent receives rule updates and commands via a persistent WebSocket connection to the server. The agent always opens this connection — the server never dials out to agents.
-- Agent logs all DNS queries (domain, timestamp, blocked/allowed) via the local resolver and batches them to the server each sync cycle.
+- Agent receives rule updates and commands via a **persistent WebSocket connection** to the server. The agent always opens this connection — the server never dials out to agents. The server pushes when it has something to send.
+- Heartbeat: a lightweight ping every 10 minutes so the server can detect stale connections.
+- DNS queries and app usage events are written to a local log buffer file immediately. The buffer is flushed to the server every **1 hour** over the WebSocket. The file is not cleared until the server acknowledges receipt — logs survive connection drops.
 - Agent scans running processes every 60 seconds and logs app usage (process name, executable path, timestamp, blocked/allowed).
 - Visited domains are checked against the category database distributed by the server (social media, adult, gambling, gaming, piracy, etc.). This is for monitoring — the admin reviews and decides what to block per child.
 - Uncategorized domains visited frequently are surfaced to the admin for manual review.
-- Logs are batched and sent on the sync cycle, not in real-time.
 
 **Agent identity and authentication:**
 - Each machine is identified by its `/etc/machine-id` — a stable, unique Linux-generated identifier.
@@ -88,10 +91,12 @@ and survive student attempts to bypass it.
 - On every request to the server, the agent presents both: machine ID (identity) and auth token (proof).
 - If a machine is decommissioned or compromised, the admin revokes the token. The server rejects all further requests from that machine ID.
 
-**Agent self-update:**
-- When the server signals a new version is available, the agent downloads the new binary and verifies its checksum.
-- Atomically replaces itself on disk via `rename()` — no moment where the binary is missing or corrupt.
-- Exits cleanly. Systemd's `Restart=always` starts the new binary automatically.
+**Agent self-update (via Supervisor):**
+- The Supervisor polls the server for new version manifests.
+- Downloads and verifies the new agent binary, starts it alongside the old one, runs a health check.
+- If health check passes: gracefully terminates the old agent, new agent takes over. Zero downtime.
+- If health check fails: kills the new binary, old agent keeps running. Automatic rollback.
+- See [DIE_WITH_OS.md](DIE_WITH_OS.md) for the full hot-swap design.
 
 ---
 
@@ -202,10 +207,10 @@ This system is intentionally personal-scale. It is the foundation for future edu
 | # | Decision | Resolution | Status |
 |---|----------|------------|--------|
 | 1 | Web blocking mechanism | Local DNS resolver (dnsmasq) + nftables to seal DNS port 53 and block known DoH IPs. Transparent proxy rejected — too complex, breaks apps. | **DECIDED** |
-| 2 | Agent-server communication | Two channels: agent→server via HTTP (status, logs); server→agent via persistent WebSocket (commands, rule updates). Agent always opens the connection — server never dials out. | **DECIDED** |
+| 2 | Agent-server communication | Single persistent WebSocket. Agent opens it; server pushes when needed (rules, commands). Logs batched to file, flushed hourly over WebSocket. 10-min heartbeat ping. File kept until server ACKs. | **DECIDED** |
 | 3 | Agent authentication | `/etc/machine-id` as identity + server-issued secret token stored in root-only `/etc/hikmalab/agent.conf`. | **DECIDED** |
 | 4 | Emergency root access | New root password sent to admin via Telegram before being applied. Admin holds it. | **DECIDED** |
-| 5 | Agent self-update | Agent downloads new binary, verifies checksum, atomically replaces via `rename()`, exits. Systemd restarts with new binary. | **DECIDED** |
+| 5 | Agent self-update | Managed by Supervisor. Downloads new binary, starts alongside old, health-checks. Pass → graceful cutover. Fail → automatic rollback, old agent untouched. See DIE_WITH_OS.md. | **DECIDED** |
 | 6 | Bot hosting | Embedded in the server process. | **DECIDED** |
 | 7 | Database engine | PostgreSQL. | **DECIDED** |
 | 8 | VPN/proxy bypass prevention | nftables blocks common VPN ports and Tor IPs. DNS sealed at kernel level. VPN process names detected via app logs. | **DECIDED** |
